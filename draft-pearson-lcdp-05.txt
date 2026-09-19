@@ -277,8 +277,13 @@ Pearson Expires 22 March 2027 [Page 4]
    not fix this, because two implementations that normalize differently
    are back where they started.
 
-   A receiver MAY accept a "0x" prefix for compatibility with existing
-   senders. A sender MUST NOT emit one.
+   A sender MUST NOT emit a "0x" prefix. A receiver MAY strip one
+   before applying the rule above, and this is the one exception to
+   "MUST NOT canonicalize": stripping a fixed, unambiguous prefix
+   cannot map two distinct values onto one, which is the harm the rule
+   exists to prevent, whereas case folding can. A receiver that strips
+   a prefix MUST still refuse the remainder if it is not lowercase and
+   of the required length.
 
 4. Core Message Types
 
@@ -327,8 +332,7 @@ Pearson Expires 22 March 2027 [Page 5]
    gets through in a small number of datagrams. An implementation MAY
    instead exempt a single outstanding challenge per source from the
    bound, provided it sends no more than one such challenge per source
-   per round-trip interval and the challenge is of fixed size; an
-   implementation MUST NOT exempt anything else.
+   per round-trip interval and the challenge is of fixed size.
 
    Second, the bound is over what the network carries, not over what
    the application wrote. An implementation SHOULD count the IP and UDP
@@ -339,8 +343,19 @@ Pearson Expires 22 March 2027 [Page 5]
    headers on one side alone misstates the ratio in whichever direction
    the omission falls.
 
-   A receiver MUST NOT send content, or any reply whose size the
-   requester controls, to an unverified source at any ratio.
+   Content sent to an unverified source is subject to the bound like
+   everything else; it is not separately forbidden. An earlier
+   revision of this text forbade it "at any ratio", which was an
+   overreach: a reply that fits within the bound is not an amplifier,
+   and the reference implementation deliberately answers an unverified
+   requester with a small content piece so that a simple client is not
+   left waiting. A receiver SHOULD, however, keep such a reply to a
+   fixed small size rather than one the requester chose.
+
+   The cookie echo of Section 4.1 is exempt from the bound. It must
+   reach an unverified source -- that is what verification is -- and
+   its size is bounded by Section 3.6 rather than by the requester.
+   This exemption and the challenge exemption above are the only two.
 
    Implementations MAY apply a ratio stricter than twice the request;
    one-for-one costs an honest peer at most one additional round trip.
@@ -349,10 +364,21 @@ Pearson Expires 22 March 2027 [Page 5]
 Pearson Expires 22 March 2027 [Page 6]
 4.1.2. Challenging a Verified Source
 
-   A sender MAY include "PleaseAlwaysReturnThisMessage" in datagrams to
-   a source it has already verified, as a liveness check or to re-bind
-   an address, and doing so is common practice: one implementation
-   bundles a challenge into approximately every datagram it sends.
+   A receiver MAY treat verification as a property of each datagram
+   rather than of a source, requiring the cookie to be echoed in every
+   datagram it is asked to act on. The reference implementation does
+   exactly this: any datagram that does not itself carry a valid echo
+   is answered as though the source were unverified, and draws a fresh
+   challenge. Independently of that, an implementation MAY challenge a
+   source it has already verified, as a liveness check or to re-bind an
+   address.
+
+   A sender SHOULD therefore carry the most recent cookie it has been
+   given in every datagram it sends to that peer, rather than echoing
+   once and considering the matter settled. A sender that echoes only
+   when challenged will be treated as unverified on every datagram in
+   between, and will receive whatever reply an unverified source is
+   owed -- which is the failure this paragraph exists to prevent.
 
    A receiver MUST NOT treat the arrival of a challenge as evidence
    that its own verification has lapsed, that a transaction in progress
@@ -589,10 +615,21 @@ Pearson Expires 22 March 2027 [Page 10]
 
 Appendix A. Changes from draft-04
 
-   Every change below closes a point on which draft-04 was silent and
-   on which two implementations consequently differed, or could have.
-   No message type, field name or field meaning is changed, and no
-   conforming draft-04 sender becomes non-conforming.
+   No message type, field name or field meaning is changed.
+
+   An earlier revision of this appendix also claimed that no
+   conforming draft-04 sender becomes non-conforming. That was wrong,
+   and the correction is worth stating rather than quietly dropping.
+   Sections 3.2, 3.4, 3.7 and 4.3.2 each narrow what draft-04 permitted
+   a sender to emit: draft-04 adopted [RFC8259] wholesale, so duplicate
+   keys were legal; it set no case, prefix or length rule for hex; it
+   told receivers to ignore unknown fields, so sending both payload
+   fields was legal; and it did not fix a field's JSON type. Each
+   narrowing removes an ambiguity that two implementations cannot
+   resolve consistently, which is why the rules are kept and the claim
+   is amended instead. A draft-04 sender that already emits lowercase
+   unprefixed hex of the required length, no duplicate keys, and at
+   most one payload field is unaffected.
 
    Wire format:
 
@@ -626,10 +663,12 @@ Appendix A. Changes from draft-04
       source rather than per datagram, because a per-datagram reading
       cannot issue the challenge that a small request calls for;
       header octets are counted on both sides or neither; content is
-      never sent to an unverified source at any ratio.
+      subject to the bound rather than separately forbidden, and the
+      cookie echo is exempt from it.
 
-   o  Section 4.1.2 (new): a challenge to an already-verified source is
-      ordinary practice and MUST NOT be read as a lapsed verification
+   o  Section 4.1.2 (new): verification MAY be a property of each
+      datagram, so a sender SHOULD carry the cookie in every datagram;
+      a challenge MUST NOT be read as a lapsed verification
 
 
 Pearson Expires 22 March 2027 [Page 11]
@@ -669,22 +708,34 @@ Appendix B. Implementation Experience
 
    The bundling assumption. cjp2p bundles its cookie challenge with
    payload, so a fetch begins with a datagram of the shape
-   [PleaseAlwaysReturnThisMessage, Content]. lcdp-rs read the first
-   message and stopped. The cookie was discarded, verification never
-   completed, and the fetch stalled with each side waiting. Nothing in
+   [Content, PleaseAlwaysReturnThisMessage] -- the piece first, the
+   challenge after it, and the piece trimmed to 32 octets precisely
+   because the request it answered carried no echo. lcdp-rs read the
+   first message and stopped. The cookie was discarded, verification
+   never completed, and the fetch stalled with each side waiting.
+   Nothing in
    draft-04 said to read the second element. Section 3.3.
 
-   Receive buffer sizing. cjp2p sends content pieces of up to 40960
-   payload octets, seven times draft-04's sending SHOULD. An
-   implementation that sized its buffer to 5888 truncated conforming
-   traffic from the reference implementation. Section 3.5.
+   Receive buffer sizing. cjp2p will serve a content piece of up to
+   40960 payload octets -- about 55000 octets of datagram once base64
+   encoded, some nine times draft-04's sending SHOULD -- to a peer that
+   asks for that much. This is read from its source rather than
+   observed on a wire, and cjp2p itself never requests more than 4096,
+   so the ceiling is reached only by a peer that asks. The point stands
+   regardless: the sending SHOULD says nothing about what a receiver
+   will be sent, and a buffer sized to 5888 is sized to the wrong
+   number. Section 3.5.
 
    The field type collision. Both implementations carry content with a
    "Content" message bearing an "eof" field, coined independently, and
    the two gave it different JSON types: one a boolean marking the last
    piece, the other the content's total octet count, sent on every
-   piece. Neither party broke a rule in draft-04 to arrive here. Each
-   now accepts both shapes. This is the origin of Section 3.4's rule on
+   piece. Neither party broke a rule in draft-04 to arrive here --
+   though Section 3.4's new rule does make lcdp-rs the offender in
+   retrospect, since it is the implementation that changed a field's
+   type after shipping it. lcdp-rs now accepts both shapes; cjp2p
+   accepts only the numeric one, and a boolean "eof" fails its
+   deserializer. This is the origin of Section 3.4's rule on
    field types and its request for namespacing. (The content transfer
    messages themselves are an extension, not core, and are not
 
@@ -693,17 +744,33 @@ Pearson Expires 22 March 2027 [Page 12]
    specified by this document; a companion document may pin them.)
 
    The unstartable handshake. Computing the 2x bound per datagram, a
-   24-octet request (52 with IPv4 and UDP headers) cannot pay for the
-   81-octet challenge that answers it (109 with headers). A strictly
-   conforming receiver could never issue the challenge. Accumulating
-   credit per source lets the same peer through in three datagrams.
-   Section 4.1.1.
+   24-octet request (52 with IPv4 and UDP headers) cannot pay for an
+   81-octet challenge (109 with headers). That challenge size is
+   lcdp-rs's, which carries a 32-hex cookie; cjp2p's is 57 octets, 85
+   with headers, which a per-datagram 2x bound does cover. So the bound
+   is unstartable for cookies of roughly thirty hex digits or more
+   rather than universally, and the challenge's size is the receiver's
+   choice. Accumulating credit per source removes the dependency on
+   that choice. Section 4.1.1.
 
-   Challenge as liveness. cjp2p re-sends its challenge to verified
-   peers roughly once per second, bundled with the piece it is
-   answering. lcdp-rs counted these toward a handshake attempt limit
-   and aborted live transfers; the longer the transfer, the more
-   reliably it failed. Section 4.1.2.
+   Challenge as liveness -- a misdiagnosis, corrected. An earlier
+   revision of this appendix said cjp2p re-sends its challenge to
+   verified peers roughly once per second, bundled with the piece it is
+   answering, and Section 4.1.2 was written around that. It is not what
+   cjp2p does. cjp2p keeps no per-source verified state for this
+   purpose: it evaluates the echo per datagram, so a challenge in its
+   reply means the datagram it answered carried no valid echo and was
+   treated as unverified -- which is also why that reply was trimmed.
+   Separately, it challenges a rotating set of peers about once a
+   second in a periodic probe, and those datagrams carry no content
+   piece at all. The once-per-second cadence lcdp-rs observed was its
+   own retry timer.
+
+   lcdp-rs counted these toward a handshake attempt limit and aborted
+   live transfers; the longer the transfer, the more reliably it
+   failed. Not counting them, as lcdp-rs now does, treats the symptom.
+   The cure is for a sender to carry the cookie in every datagram, and
+   Section 4.1.2 now says so.
 
    The public key spelling. draft-04's "ed25519h" was read as a hash of
    a key, its "h" suffix suggesting one, while its use suggested a key.
